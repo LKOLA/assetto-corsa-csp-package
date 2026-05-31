@@ -1,14 +1,15 @@
 -- ============================================================================
 -- Chaser Camera - Insta360 Rear View (Cinematic)
 -- ============================================================================
--- A production-ready rear-mounted camera that simulates an Insta360 action cam
+-- PRODUCTION PHYSICS: Rear-mounted camera simulating Insta360 action cam
 -- mounted behind a sports car.
 --
 -- Features:
 --   * Horizon lock (stable horizon on camber)
---   * Smooth yaw/pitch tracking with gimbal inertia
+--   * Smooth yaw/pitch/roll tracking with gimbal inertia
 --   * Dynamic FOV (increases at high speed)
 --   * Direction-following with look-ahead bias
+--   * Spring-damper camera physics for natural motion
 --   * Stable under all dynamic conditions
 --
 -- Compatible with CSP 0.3.0-preview342+
@@ -16,36 +17,58 @@
 -- ============================================================================
 
 local settings = {}
-local camera_state = {
-  target_yaw = 0,
-  target_pitch = 0,
+local camera_physics = {
+  -- Gimbal rotation state
   current_yaw = 0,
   current_pitch = 0,
+  current_roll = 0,
+  
+  -- Gimbal velocity (for inertia)
+  yaw_velocity = 0,
+  pitch_velocity = 0,
+  roll_velocity = 0,
+  
+  -- FOV state
   current_fov = 108,
-  frame_time = 0.016,
+  
+  -- Frame timing
+  frame_delta = 0.016,
+  simulation_time = 0,
 }
 
 -- ============================================================================
 -- Settings Loading
 -- ============================================================================
 local function load_settings()
-  -- Default settings (fallback)
   local defaults = {
-    distance = 4.2,
-    height = 1.95,
-    base_fov = 108,
-    speed_fov_threshold = 150,
-    high_speed_fov = 112,
-    yaw_smoothing = 0.18,
-    pitch_smoothing = 0.22,
-    roll_damping = 0.85,
-    look_ahead = 0.08,
-    rotation_inertia = 0.12,
-    lateral_offset = 0.0,
+    -- Camera positioning
+    distance = 4.2,              -- Distance behind car (meters)
+    height = 1.95,               -- Height above ground (meters)
+    lateral_offset = 0.0,        -- Left-right offset from centerline
+    
+    -- FOV dynamics
+    base_fov = 108,              -- Base field of view (degrees)
+    speed_fov_threshold = 150,   -- Speed at which FOV increases (km/h)
+    high_speed_fov = 112,        -- FOV at high speed (degrees)
+    
+    -- Gimbal smoothing (lower = snappier, higher = sluggish)
+    yaw_smoothing = 0.15,        -- Horizontal tracking smoothness
+    pitch_smoothing = 0.20,      -- Vertical tracking smoothness
+    roll_smoothing = 0.25,       -- Horizon lock smoothness
+    
+    -- Gimbal inertia (rotational lag from physics)
+    rotation_inertia = 0.08,     -- Gimbal lag (0-0.3, higher = more lag)
+    
+    -- Horizon lock damping (higher = more stable)
+    roll_damping = 0.82,         -- Prevents excessive tilt on camber
+    
+    -- Direction-following bias
+    look_ahead = 0.06,           -- Bias toward direction of travel
+    yaw_lead_gain = 1.0,         -- Yaw response to car heading
+    
     enabled = 1,
   }
 
-  -- Try to load from settings.ini
   local config_path = "extension/lua/chaser-camera/settings.ini"
   if io.fileExists(config_path) then
     local config = ac.INIConfig.load(config_path)
@@ -63,91 +86,104 @@ local function load_settings()
 end
 
 -- ============================================================================
--- Vector and Math Utilities
+-- Math Utilities
 -- ============================================================================
+
 local function normalize_angle(angle)
-  -- Normalize angle to -π to π range
+  -- Normalize to -π to +π range
   while angle > math.pi do angle = angle - 2 * math.pi end
   while angle < -math.pi do angle = angle + 2 * math.pi end
   return angle
 end
 
-local function shortest_angle_diff(from, to)
-  -- Calculate shortest rotational distance between two angles
-  local diff = normalize_angle(to - from)
+local function shortest_angle_diff(current, target)
+  -- Calculate shortest rotational path
+  local diff = normalize_angle(target - current)
   return diff
 end
 
-local function smooth_damp(current, target, smoothing, dt)
-  -- Exponential smoothing with frame-time independence
-  local speed = math.exp(-smoothing * 10)
-  local difference = target - current
-  return current + difference * (1 - speed)
+local function gimbal_inertia_physics(current, velocity, target, smoothing, inertia, dt)
+  -- Physics-based gimbal tracking with rotational inertia
+  -- Models: angular_accel = -k*(angle - target) - c*angular_velocity
+  
+  local angle_error = shortest_angle_diff(current, target)
+  
+  -- Spring-like force toward target
+  local stiffness = (1.0 - smoothing) * 3.0
+  local spring_force = angle_error * stiffness
+  
+  -- Damping to prevent oscillation
+  local damping = smoothing * 2.0
+  local damping_force = -velocity * damping
+  
+  -- Inertia: rotational lag (gimbal doesn't snap instantly)
+  local inertia_force = inertia * 0.5
+  
+  local total_force = spring_force + damping_force
+  local angular_accel = total_force * (1.0 - inertia_force)
+  
+  local new_velocity = velocity + angular_accel * dt
+  local new_angle = current + new_velocity * dt
+  
+  return normalize_angle(new_angle), new_velocity
+end
+
+local function exponential_damp(current, target, smoothing, dt)
+  -- Simple exponential smoothing
+  local alpha = 1.0 - math.exp(-smoothing * 10)
+  return current + (target - current) * alpha
 end
 
 -- ============================================================================
--- Camera Position & Orientation Calculation
+-- Camera Orientation Calculation
 -- ============================================================================
 
-local function calculate_camera_position()
-  -- Get car transform
+local function calculate_target_angles()
   local car = ac.getCar(0)
-  if not car then return vec3(0, 0, 0), 0, 0 end
+  if not car then return 0, 0, 0 end
   
-  local car_pos = car.position
-  local car_dir = car.look:normalize()  -- Forward direction
-  local car_side = car.side:normalize()  -- Right direction
-  local car_up = car.up:normalize()      -- Up direction
-  
-  -- Position camera behind car
-  local behind_offset = car_dir * -settings.distance
-  local height_offset = car_up * settings.height
-  local lateral_offset = car_side * settings.lateral_offset
-  
-  local camera_pos = car_pos + behind_offset + height_offset + lateral_offset
-  
-  return camera_pos, car_dir, car_up
-end
-
-local function calculate_target_yaw_pitch(car_dir, car_up)
-  -- Calculate yaw (horizontal angle) and pitch (vertical angle)
-  -- relative to camera looking at car rear
-  
-  local car = ac.getCar(0)
-  if not car then return 0, 0 end
-  
-  -- Car velocity direction (for look-ahead bias)
+  local car_dir = car.look:normalize()    -- Car forward
+  local car_side = car.side:normalize()   -- Car right
+  local car_up = car.up:normalize()       -- Car up
   local velocity = car.velocity:normalize()
   
-  -- Yaw: angle in horizontal plane
-  local horizontal_dir = vec3(car_dir.x, 0, car_dir.z):normalize()
-  local yaw = math.atan2(horizontal_dir.z, horizontal_dir.x)
+  -- YAW: Horizontal angle (left-right looking at car rear)
+  -- This is the primary tracking axis
+  local horizontal_proj = vec3(car_dir.x, 0, car_dir.z):normalize()
+  local yaw = math.atan2(horizontal_proj.z, horizontal_proj.x)
   
   -- Apply look-ahead bias (camera leads in direction of travel)
-  if velocity:length() > 0.1 then
+  if velocity:length() > 0.5 then
     local velocity_yaw = math.atan2(velocity.z, velocity.x)
-    local yaw_diff = normalize_angle(velocity_yaw - yaw)
+    local yaw_diff = shortest_angle_diff(yaw, velocity_yaw)
     yaw = yaw + yaw_diff * settings.look_ahead
   end
   
-  -- Pitch: vertical angle (slight downward tilt)
+  -- PITCH: Vertical angle (slight downward tilt to see rear bumper)
+  -- Fixed slight downward angle for framing
   local pitch = math.atan2(-car_dir.y, 
                           math.sqrt(car_dir.x * car_dir.x + car_dir.z * car_dir.z))
-  pitch = pitch * 0.3  -- Dampen pitch oscillation
+  pitch = pitch * 0.25  -- Dampen pitch to keep horizon level
   
-  return yaw, pitch
+  -- ROLL: Camera tilt (for horizon lock)
+  -- Extract roll from car up vector
+  local roll = math.atan2(car_side.y, car_up.y)
+  roll = roll * (1.0 - settings.roll_damping)  -- Dampen roll for stable horizon
+  
+  return yaw, pitch, roll
 end
 
 local function calculate_dynamic_fov()
-  -- Increase FOV at high speeds (dynamic zoom effect)
+  -- Increase FOV at high speeds (cinematic zoom)
   local car = ac.getCar(0)
   if not car then return settings.base_fov end
   
-  local speed_kmh = car.speedometer * 3.6  -- Convert m/s to km/h
+  local speed_kmh = car.speedometer * 3.6  -- m/s to km/h
   
   if speed_kmh > settings.speed_fov_threshold then
-    -- Linear interpolation between base and high-speed FOV
-    local speed_factor = math.min((speed_kmh - settings.speed_fov_threshold) / 100, 1)
+    -- Linear interpolation
+    local excess_speed = math.min(speed_kmh - settings.speed_fov_threshold, 100)
+    local speed_factor = excess_speed / 100
     local target_fov = settings.base_fov + (settings.high_speed_fov - settings.base_fov) * speed_factor
     return target_fov
   else
@@ -155,124 +191,139 @@ local function calculate_dynamic_fov()
   end
 end
 
-local function apply_horizon_lock(pitch, roll)
-  -- Dampen roll to keep horizon stable
-  -- This prevents excessive camera tilt on camber
+-- ============================================================================
+-- Camera Position Calculation
+-- ============================================================================
+
+local function calculate_camera_position()
   local car = ac.getCar(0)
-  if not car then return pitch, 0 end
-  
-  -- Get car's actual roll angle
-  local car_right = car.side
-  local world_right = vec3(1, 0, 0)
-  local roll_angle = math.acos(math.clamp(car_right:dot(world_right), -1, 1))
-  
-  -- Apply damping to roll to keep horizon lock
-  local damped_roll = roll_angle * (1 - settings.roll_damping)
-  
-  return pitch, damped_roll
-end
-
--- ============================================================================
--- Camera Update Loop
--- ============================================================================
-
-local function update_camera(dt)
-  if settings.enabled == 0 then return end
-  
-  camera_state.frame_time = dt
-  
-  -- Get car position and orientation
-  local camera_pos, car_dir, car_up = calculate_camera_position()
-  if not camera_pos then return end
-  
-  -- Calculate target yaw and pitch
-  local target_yaw, target_pitch = calculate_target_yaw_pitch(car_dir, car_up)
-  
-  -- Apply rotation inertia (gimbal lag)
-  local yaw_smooth = settings.yaw_smoothing + settings.rotation_inertia
-  local pitch_smooth = settings.pitch_smoothing + settings.rotation_inertia
-  
-  -- Smooth camera rotation
-  camera_state.current_yaw = smooth_damp(camera_state.current_yaw, target_yaw, yaw_smooth, dt)
-  camera_state.current_pitch = smooth_damp(camera_state.current_pitch, target_pitch, pitch_smooth, dt)
-  
-  -- Apply horizon lock to dampen roll
-  local _, locked_roll = apply_horizon_lock(camera_state.current_pitch, 0)
-  
-  -- Calculate dynamic FOV
-  local target_fov = calculate_dynamic_fov()
-  camera_state.current_fov = smooth_damp(camera_state.current_fov, target_fov, 0.1, dt)
-end
-
-function script.update(dt)
-  -- Called each frame by CSP
-  if settings.enabled == 1 then
-    update_camera(dt)
-  end
-end
-
--- ============================================================================
--- Camera Callback
--- ============================================================================
-
-function script.onCameraUpdate(camera)
-  if settings.enabled == 0 then return end
-  
-  -- Only apply to chaser/external camera
-  if camera.cameraType ~= "chaser" and camera.cameraType ~= "external" then
-    return
-  end
-  
-  -- Get car state
-  local car = ac.getCar(0)
-  if not car then return end
+  if not car then return vec3(0, 0, 0) end
   
   local car_pos = car.position
   local car_dir = car.look:normalize()
   local car_up = car.up:normalize()
   local car_side = car.side:normalize()
   
-  -- Position camera behind car
-  local behind_offset = car_dir * -settings.distance
-  local height_offset = car_up * settings.height
-  local lateral_offset = car_side * settings.lateral_offset
+  -- Position camera behind and above car
+  local behind = car_dir * -settings.distance
+  local above = car_up * settings.height
+  local lateral = car_side * settings.lateral_offset
   
-  local camera_pos = car_pos + behind_offset + height_offset + lateral_offset
-  camera.position = camera_pos
+  return car_pos + behind + above + lateral
+end
+
+local function build_rotation_matrix(yaw, pitch, roll)
+  -- Build rotation matrix from Euler angles (yaw-pitch-roll)
+  local cy = math.cos(yaw)
+  local sy = math.sin(yaw)
+  local cp = math.cos(pitch)
+  local sp = math.sin(pitch)
+  local cr = math.cos(roll)
+  local sr = math.sin(roll)
   
-  -- Look at car rear with calculated yaw/pitch
-  -- Build rotation matrix from yaw and pitch
-  local cos_yaw = math.cos(camera_state.current_yaw)
-  local sin_yaw = math.sin(camera_state.current_yaw)
-  local cos_pitch = math.cos(camera_state.current_pitch)
-  local sin_pitch = math.sin(camera_state.current_pitch)
-  
-  -- Forward direction (looking at car)
-  local look_dir = vec3(
-    sin_yaw * cos_pitch,
-    sin_pitch,
-    cos_yaw * cos_pitch
+  -- Calculate forward direction (camera looking vector)
+  local look = vec3(
+    sy * cp * cr - cy * sr,
+    sp * cr,
+    cy * cp * cr + sy * sr
   ):normalize()
   
-  -- Up direction (with horizon lock)
-  local up_dir = vec3(
-    -sin_yaw * sin_pitch,
-    cos_pitch,
-    -cos_yaw * sin_pitch
+  -- Calculate up direction
+  local up = vec3(
+    sy * cp * sr + cy * cr,
+    sp * sr,
+    cy * cp * sr - sy * cr
   ):normalize()
+  
+  return look, up
+end
+
+-- ============================================================================
+-- Update Loop
+-- ============================================================================
+
+local function update_camera(dt)
+  if settings.enabled ~= 1 then return end
+  
+  camera_physics.frame_delta = dt
+  camera_physics.simulation_time = camera_physics.simulation_time + dt
+  
+  -- Calculate target gimbal angles
+  local target_yaw, target_pitch, target_roll = calculate_target_angles()
+  
+  -- Apply gimbal inertia physics (smooth tracking with lag)
+  camera_physics.current_yaw, camera_physics.yaw_velocity = gimbal_inertia_physics(
+    camera_physics.current_yaw,
+    camera_physics.yaw_velocity,
+    target_yaw,
+    settings.yaw_smoothing,
+    settings.rotation_inertia,
+    dt
+  )
+  
+  camera_physics.current_pitch, camera_physics.pitch_velocity = gimbal_inertia_physics(
+    camera_physics.current_pitch,
+    camera_physics.pitch_velocity,
+    target_pitch,
+    settings.pitch_smoothing,
+    settings.rotation_inertia * 0.7,
+    dt
+  )
+  
+  camera_physics.current_roll, camera_physics.roll_velocity = gimbal_inertia_physics(
+    camera_physics.current_roll,
+    camera_physics.roll_velocity,
+    target_roll,
+    settings.roll_smoothing,
+    settings.rotation_inertia * 0.5,
+    dt
+  )
+  
+  -- Calculate dynamic FOV
+  local target_fov = calculate_dynamic_fov()
+  camera_physics.current_fov = exponential_damp(camera_physics.current_fov, target_fov, 0.12, dt)
+end
+
+function script.update(dt)
+  if settings.enabled ~= 1 then return end
+  update_camera(dt)
+end
+
+-- ============================================================================
+-- Camera Callback (CSP Integration)
+-- ============================================================================
+
+function script.onCameraUpdate(camera)
+  if settings.enabled ~= 1 then return end
+  if not camera then return end
+  
+  -- Apply to external/chaser cameras
+  if camera.cameraType and camera.cameraType ~= "chaser" and camera.cameraType ~= "external" then
+    return
+  end
+  
+  -- Set camera position
+  camera.position = calculate_camera_position()
+  
+  -- Set camera orientation using gimbal angles
+  local look_dir, up_dir = build_rotation_matrix(
+    camera_physics.current_yaw,
+    camera_physics.current_pitch,
+    camera_physics.current_roll
+  )
   
   camera.look = look_dir
   camera.up = up_dir
-  camera.fov = camera_state.current_fov
+  camera.fov = camera_physics.current_fov
 end
 
 function script.onGUIDrawAfterCars(draw_now)
-  -- Optional: Draw debug info
-  -- Uncomment to see real-time camera values during gameplay
+  -- Debug info (uncomment to display values)
   -- if settings.enabled == 1 then
-  --   ui.text("Insta360 Yaw: " .. string.format("%.1f°", math.deg(camera_state.current_yaw)))
-  --   ui.text("Insta360 Pitch: " .. string.format("%.1f°", math.deg(camera_state.current_pitch)))
-  --   ui.text("Insta360 FOV: " .. string.format("%.1f°", camera_state.current_fov))
+  --   ui.text("Insta360 | Yaw: " .. string.format("%.1f°", math.deg(camera_physics.current_yaw)))
+  --   ui.text("Insta360 | Pitch: " .. string.format("%.1f°", math.deg(camera_physics.current_pitch)))
+  --   ui.text("Insta360 | Roll: " .. string.format("%.1f°", math.deg(camera_physics.current_roll)))
+  --   ui.text("Insta360 | FOV: " .. string.format("%.1f°", camera_physics.current_fov))
   -- end
 end
 

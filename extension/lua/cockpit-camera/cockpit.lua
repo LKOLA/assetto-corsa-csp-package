@@ -1,10 +1,11 @@
 -- ============================================================================
 -- Cockpit Camera - NeckFX Ultra-Realistic Driver Head Movement
 -- ============================================================================
--- Simulates realistic driver head behavior based on:
---   * Longitudinal G-forces (acceleration/braking)
---   * Lateral G-forces (cornering forces)
---   * Vertical suspension movement (bumps/kerbs)
+-- PRODUCTION PHYSICS: Simulates realistic driver head behavior based on:
+--   * Longitudinal G-forces (acceleration/braking with lag)
+--   * Lateral G-forces (cornering with spring-damper physics)
+--   * Vertical suspension compression (bumps/kerbs)
+--   * Rotational inertia (head doesn't follow instantly)
 --   * Natural look-ahead bias
 --
 -- Compatible with CSP 0.3.0-preview342+
@@ -12,32 +13,56 @@
 -- ============================================================================
 
 local settings = {}
-local camera_state = {
-  head_position = vec3(0, 0, 0),
-  head_velocity = vec3(0, 0, 0),
-  last_accel = vec3(0, 0, 0),
+local physics_state = {
+  -- Head position (relative to driver seated position)
+  head_x = 0,        -- Lateral (left-right, meters)
+  head_y = 0,        -- Vertical (up-down, meters)
+  head_z = 0,        -- Longitudinal (forward-back, meters)
+  
+  -- Head velocity (for inertia physics)
+  vel_x = 0,
+  vel_y = 0,
+  vel_z = 0,
+  
+  -- Previous frame state (for acceleration calculation)
+  last_velocity = vec3(0, 0, 0),
+  last_suspension_avg = 0,
+  
+  -- Frame timing
   frame_delta = 0.016,
+  simulation_time = 0,
 }
 
 -- ============================================================================
 -- Settings Loading
 -- ============================================================================
 local function load_settings()
-  -- Default settings (fallback if ini not found)
   local defaults = {
-    longitudinal_lag = 0.85,
-    braking_response = 1.2,
-    lateral_stiffness = 0.75,
-    vertical_sensitivity = 1.0,
-    smoothing = 0.12,
-    look_ahead_bias = 0.15,
-    longitudinal_g_scale = 1.0,
-    lateral_g_scale = 1.0,
-    max_vertical_displacement = 0.12,
+    -- Physics parameters
+    longitudinal_lag = 0.85,       -- How much head lags during accel (0-1)
+    braking_multiplier = 1.3,      -- Head movement stronger during braking
+    lateral_stiffness = 0.68,      -- Spring stiffness for lateral movement
+    lateral_damping = 0.35,        -- Damping factor for lateral oscillation
+    vertical_sensitivity = 1.0,    -- Suspension bump response
+    vertical_damping = 0.6,        -- Vertical oscillation damping
+    
+    -- Smoothing and response
+    update_smoothing = 0.08,       -- Position smoothing factor (0-0.3)
+    look_ahead_bias = 0.12,        -- Natural head turn into corners
+    
+    -- G-force scales
+    longitudinal_g_scale = 9.81,   -- Multiply accel by this to get realistic G
+    lateral_g_scale = 9.81,
+    vertical_g_scale = 5.0,
+    
+    -- Limits
+    max_lateral_displacement = 0.085,    -- Max head tilt left-right
+    max_vertical_displacement = 0.15,    -- Max head compression up-down
+    max_forward_displacement = 0.07,     -- Max head lurch forward-back
+    
     enabled = 1,
   }
 
-  -- Try to load from settings.ini
   local config_path = "extension/lua/cockpit-camera/settings.ini"
   if io.fileExists(config_path) then
     local config = ac.INIConfig.load(config_path)
@@ -50,153 +75,217 @@ local function load_settings()
       end
     end
   else
-    -- Use defaults if config not found
     settings = defaults
   end
 end
 
 -- ============================================================================
--- Physics Calculations
+-- G-Force and Dynamics Calculations
 -- ============================================================================
 
-local function get_car_acceleration()
-  -- Get car acceleration from physics (m/s²)
-  local physics = ac.getCarState(0)
-  if not physics then return vec3(0, 0, 0) end
+local function calculate_car_acceleration()
+  -- Get car velocity and calculate acceleration from derivative
+  local car = ac.getCar(0)
+  if not car then return vec3(0, 0, 0) end
   
-  -- Use velocity derivative to estimate acceleration
-  local current_velocity = physics.velocity
-  local accel = (current_velocity - camera_state.last_accel) / (camera_state.frame_delta + 0.0001)
-  camera_state.last_accel = current_velocity
+  local current_velocity = car.velocity
+  local dt = physics_state.frame_delta + 0.00001
   
-  return accel
+  -- Calculate acceleration in world space
+  local world_accel = (current_velocity - physics_state.last_velocity) / dt
+  physics_state.last_velocity = current_velocity
+  
+  -- Convert to car-local space for realistic head physics
+  -- Forward acceleration (Z), Lateral acceleration (X), Vertical (Y)
+  local car_look = car.look:normalize()
+  local car_side = car.side:normalize()
+  local car_up = car.up:normalize()
+  
+  local local_accel = vec3(
+    world_accel:dot(car_side),      -- Lateral G (left-right)
+    world_accel:dot(car_up),        -- Vertical G (up-down, usually gravity)
+    world_accel:dot(car_look)       -- Longitudinal G (forward-back)
+  )
+  
+  return local_accel
 end
 
-local function get_suspension_movement()
-  -- Calculate vertical movement from suspension compression
-  -- Returns normalized value (-1 to +1) for vertical travel
-  local physics = ac.getCarState(0)
-  if not physics then return 0 end
+local function get_average_suspension_travel()
+  -- Get suspension compression across all wheels (0 = fully extended, 1 = compressed)
+  local car = ac.getCar(0)
+  if not car then return 0 end
   
-  -- Use suspension position averaged across all wheels
-  local suspension_sum = 0
-  local wheel_count = 0
+  -- Try to use suspension position if available
+  local total_suspension = 0
+  local suspension_count = 0
   
-  for i = 1, 4 do
-    local wheel_speed = physics.wheelAngularVelocity(i - 1)
-    if wheel_speed then
-      wheel_count = wheel_count + 1
+  for i = 0, 3 do
+    local wheel = car.wheels[i]
+    if wheel then
+      -- Normalized suspension travel (0-1 range)
+      local suspension_travel = 1.0 - math.clamp(wheel.camber / 0.3, 0, 1)
+      total_suspension = total_suspension + suspension_travel
+      suspension_count = suspension_count + 1
     end
   end
   
-  -- Simplified: use vertical acceleration component
-  local physics_accel = get_car_acceleration()
-  return physics_accel.y / 40  -- Normalize to suspension range
+  if suspension_count > 0 then
+    return total_suspension / suspension_count
+  else
+    return 0
+  end
 end
 
-local function calculate_head_target()
-  -- Calculate target head position based on car dynamics
-  local physics = ac.getCarState(0)
-  if not physics then return vec3(0, 0, 0) end
+local function spring_damper_physics(current, velocity, target, stiffness, damping, dt)
+  -- Realistic spring-damper system for head movement
+  -- Models a mass-spring-damper: m*a = -k*x - c*v
   
-  local target = vec3(0, 0, 0)
+  local displacement = target - current
+  local spring_force = displacement * stiffness * 100  -- Stiffness factor
+  local damping_force = -velocity * damping * 5       -- Damping force
   
-  -- Longitudinal G-forces (acceleration/braking lag)
-  local accel = get_car_acceleration()
-  local long_force = accel.z * settings.longitudinal_g_scale  -- Forward/backward
+  local total_force = spring_force + damping_force
+  local acceleration = total_force * 0.5  -- Mass-like factor
   
-  -- Braking creates stronger forward head movement
-  if long_force < 0 then
-    long_force = long_force * settings.braking_response
+  local new_velocity = velocity + acceleration * dt
+  local new_position = current + new_velocity * dt
+  
+  return new_position, new_velocity
+end
+
+local function apply_exponential_smoothing(current, target, smoothing_factor)
+  -- Exponential smoothing: position = current + (target - current) * (1 - exp(-k*t))
+  local alpha = 1.0 - math.exp(-smoothing_factor * 10)
+  return current + (target - current) * alpha
+end
+
+-- ============================================================================
+-- Head Position Calculation (Core Physics)
+-- ============================================================================
+
+local function calculate_head_movement()
+  local car = ac.getCar(0)
+  if not car then return vec3(0, 0, 0) end
+  
+  -- Calculate G-forces in car-local space
+  local accel = calculate_car_acceleration()
+  local g_force = accel / 9.81
+  
+  -- LONGITUDINAL (Z): Acceleration/Braking lag
+  -- Head lags backward during acceleration, lurches forward during braking
+  local longitudinal_g = g_force.z
+  local braking_multiplier = 1.0
+  if longitudinal_g < 0 then
+    braking_multiplier = settings.braking_multiplier
   end
   
-  target.z = -long_force * settings.longitudinal_lag * 0.015  -- Z lag (back/forward)
+  local target_z = -longitudinal_g * settings.longitudinal_lag * 0.06 * braking_multiplier
   
-  -- Lateral G-forces (cornering)
-  local lateral_force = accel.x * settings.lateral_g_scale  -- Left/right
-  local lateral_mag = math.abs(lateral_force) * (1 - settings.lateral_stiffness)
-  target.x = math.clamp(lateral_force * 0.012 * (1 - settings.lateral_stiffness), -0.08, 0.08)
+  -- LATERAL (X): Cornering compression
+  -- Head compresses inward toward the turn (spring-damper system)
+  local lateral_g = g_force.x
+  local target_x = -lateral_g * 0.05 * (1 - settings.lateral_stiffness)
   
-  -- Vertical suspension movement (bumps/kerbs)
-  local susp_movement = get_suspension_movement()
-  target.y = math.clamp(susp_movement * settings.vertical_sensitivity * settings.max_vertical_displacement, 
-                        -settings.max_vertical_displacement, 
-                        settings.max_vertical_displacement)
+  -- Use spring-damper for natural oscillation behavior
+  physics_state.head_x, physics_state.vel_x = spring_damper_physics(
+    physics_state.head_x,
+    physics_state.vel_x,
+    target_x,
+    settings.lateral_stiffness,
+    settings.lateral_damping,
+    physics_state.frame_delta
+  )
   
-  -- Look-ahead bias (natural direction leading)
-  -- Head turns slightly in direction of travel
-  local velocity = physics.velocity
-  if velocity:length() > 1 then
+  -- VERTICAL (Y): Suspension compression
+  -- Head compresses when hitting bumps, bounces back up
+  local suspension_avg = get_average_suspension_travel()
+  local suspension_change = suspension_avg - physics_state.last_suspension_avg
+  physics_state.last_suspension_avg = suspension_avg
+  
+  -- Bump creates downward compression
+  local suspension_force = suspension_change * settings.vertical_sensitivity * 0.15
+  local target_y = -suspension_avg * settings.vertical_sensitivity * settings.max_vertical_displacement
+  
+  -- Apply spring-damper to vertical
+  physics_state.head_y, physics_state.vel_y = spring_damper_physics(
+    physics_state.head_y,
+    physics_state.vel_y,
+    target_y + suspension_force,
+    0.4,  -- Vertical stiffness
+    settings.vertical_damping,
+    physics_state.frame_delta
+  )
+  
+  -- Apply smoothing to all axes
+  physics_state.head_x = apply_exponential_smoothing(physics_state.head_x, physics_state.head_x, settings.update_smoothing)
+  physics_state.head_y = apply_exponential_smoothing(physics_state.head_y, physics_state.head_y, settings.update_smoothing)
+  physics_state.head_z = apply_exponential_smoothing(physics_state.head_z, target_z, settings.update_smoothing)
+  
+  -- Clamp to physical limits
+  physics_state.head_x = math.clamp(physics_state.head_x, -settings.max_lateral_displacement, settings.max_lateral_displacement)
+  physics_state.head_y = math.clamp(physics_state.head_y, -settings.max_vertical_displacement, settings.max_vertical_displacement)
+  physics_state.head_z = math.clamp(physics_state.head_z, -settings.max_forward_displacement, settings.max_forward_displacement)
+  
+  return vec3(physics_state.head_x, physics_state.head_y, physics_state.head_z)
+end
+
+local function apply_look_ahead_bias(head_pos)
+  -- Natural head turn into the direction of travel (prospective bias)
+  local car = ac.getCar(0)
+  if not car then return head_pos end
+  
+  local velocity = car.velocity
+  if velocity:length() > 2 then
     local velocity_normalized = velocity:normalize()
-    target.x = target.x + velocity_normalized.x * settings.look_ahead_bias * 0.02
+    local car_forward = car.look:normalize()
+    local car_side = car.side:normalize()
+    
+    -- Calculate if we're turning (cross product)
+    local steering_angle = math.atan2(velocity_normalized:dot(car_side), velocity_normalized:dot(car_forward))
+    
+    -- Apply look-ahead bias (head turns slightly into corners)
+    head_pos.x = head_pos.x + steering_angle * settings.look_ahead_bias * 0.03
   end
   
-  return target
-end
-
-local function apply_smoothing(current, target)
-  -- Smooth camera transition using exponential decay
-  local smoothing_factor = math.exp(-settings.smoothing * 10)
-  return current * smoothing_factor + target * (1 - smoothing_factor)
+  return head_pos
 end
 
 -- ============================================================================
--- Camera Update
--- ============================================================================
-
-local function update_cockpit_camera(dt)
-  if settings.enabled == 0 then return end
-  
-  camera_state.frame_delta = dt
-  
-  -- Calculate target head position
-  local target_position = calculate_head_target()
-  
-  -- Apply smoothing to avoid jittery movement
-  camera_state.head_position.x = apply_smoothing(camera_state.head_position.x, target_position.x)
-  camera_state.head_position.y = apply_smoothing(camera_state.head_position.y, target_position.y)
-  camera_state.head_position.z = apply_smoothing(camera_state.head_position.z, target_position.z)
-  
-  -- Clamp to max displacement
-  local max_lateral = 0.08
-  local max_vertical = settings.max_vertical_displacement
-  local max_forward = 0.06
-  
-  camera_state.head_position.x = math.clamp(camera_state.head_position.x, -max_lateral, max_lateral)
-  camera_state.head_position.y = math.clamp(camera_state.head_position.y, -max_vertical, max_vertical)
-  camera_state.head_position.z = math.clamp(camera_state.head_position.z, -max_forward, max_forward)
-end
-
--- ============================================================================
--- CSP Integration Callback
+-- CSP Integration
 -- ============================================================================
 
 function script.update(dt)
-  -- Called each frame by CSP
-  if settings.enabled == 1 then
-    update_cockpit_camera(dt)
+  if settings.enabled ~= 1 then return end
+  
+  physics_state.frame_delta = dt
+  physics_state.simulation_time = physics_state.simulation_time + dt
+end
+
+function script.onCameraUpdate(camera)
+  if settings.enabled ~= 1 then return end
+  
+  -- Only apply to cockpit camera
+  if not camera or (camera.cameraType and camera.cameraType ~= "cockpit") then
+    return
+  end
+  
+  -- Calculate head movement with physics
+  local head_offset = calculate_head_movement()
+  head_offset = apply_look_ahead_bias(head_offset)
+  
+  -- Apply head movement offset to camera position
+  if camera.position then
+    camera.position = camera.position + head_offset
   end
 end
 
 function script.drawUI()
-  -- Optional: Debug display
-  -- Uncomment to see real-time head position values
-  -- ui.text("Head Pos: " .. tostring(camera_state.head_position))
-end
-
--- ============================================================================
--- Camera Modifier for Cockpit View
--- ============================================================================
-
-function script.onCameraUpdate(camera)
-  if settings.enabled == 0 then return end
-  
-  -- Only apply to cockpit camera
-  if camera.cameraType ~= "cockpit" then return end
-  
-  -- Apply head movement offset to camera
-  -- This modifies the view position relative to car center
-  camera.position = camera.position + camera_state.head_position
+  -- Debug display (uncomment to see values)
+  -- if settings.enabled == 1 then
+  --   ui.text("NeckFX X: " .. string.format("%.3f", physics_state.head_x))
+  --   ui.text("NeckFX Y: " .. string.format("%.3f", physics_state.head_y))
+  --   ui.text("NeckFX Z: " .. string.format("%.3f", physics_state.head_z))
+  -- end
 end
 
 -- ============================================================================
@@ -208,6 +297,6 @@ load_settings()
 return {
   name = "Cockpit Camera - NeckFX",
   onUpdate = script.update,
-  onDrawUI = script.drawUI,
   onCameraUpdate = script.onCameraUpdate,
+  onDrawUI = script.drawUI,
 }
